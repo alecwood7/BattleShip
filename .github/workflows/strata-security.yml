@@ -1,0 +1,101 @@
+# Strata Security — GitHub Actions workflow
+# Generated for: alec.hv.wood@gmail.com
+#
+# Setup:
+#   1. In your GitHub repository go to Settings → Secrets and variables → Actions
+#   2. Add secret  STRATA_API_KEY  with your Strata CI/CD API key
+#   3. Add secret  STRATA_API_URL  with your Strata instance URL:
+#                  https://api.strata-security.com
+#   4. Copy this file to .github/workflows/strata-security.yml
+#
+# python3 is pre-installed on ubuntu-latest — no extra setup required.
+
+name: Strata Security Assessment
+
+on:
+  push:
+    branches: ["main", "master"]
+  pull_request:
+
+jobs:
+  strata-security:
+    name: Security Assessment
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Trigger Strata Security Scan
+        id: strata
+        env:
+          STRATA_API_KEY: ${{ secrets.STRATA_API_KEY }}
+          STRATA_API_URL: ${{ secrets.STRATA_API_URL }}
+        run: |
+          set -euo pipefail
+          REPO_URL="${{ github.server_url }}/${{ github.repository }}"
+          BRANCH="${{ github.head_ref || github.ref_name }}"
+          FAIL_ON='["critical", "high"]'
+
+          echo "Triggering Strata scan: $REPO_URL @ $BRANCH"
+
+          TRIGGER=$(curl -sf -X POST "$STRATA_API_URL/cicd/scans" \
+            -H "X-API-Key: $STRATA_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d "{\"url\": \"$REPO_URL\", \"branch\": \"$BRANCH\", \"fail_on\": $FAIL_ON}")
+
+          SCAN_ID=$(echo "$TRIGGER" | python3 -c "import sys,json; print(json.load(sys.stdin)['scan_id'])")
+          if [ -z "$SCAN_ID" ]; then
+            echo "::error::Strata API did not return a scan_id"
+            exit 1
+          fi
+          echo "scan_id=$SCAN_ID" >> $GITHUB_OUTPUT
+          echo "Scan ID: $SCAN_ID"
+
+          # Poll until complete (max 25 × 30s = ~12.5 min)
+          VERDICT=""
+          for i in $(seq 1 25); do
+            sleep 30
+            RESULT=$(curl -sf "$STRATA_API_URL/cicd/scans/$SCAN_ID" \
+              -H "X-API-Key: $STRATA_API_KEY")
+
+            STATUS=$(echo "$RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status',''))")
+            echo "Poll $i: $STATUS"
+
+            if [ "$STATUS" = "complete" ] || [ "$STATUS" = "failed" ]; then
+              VERDICT=$(echo "$RESULT"  | python3 -c "import sys,json; print(json.load(sys.stdin).get('verdict',''))")
+              REASON=$(echo "$RESULT"   | python3 -c "import sys,json; print(json.load(sys.stdin).get('fail_reason') or '')")
+              SCORE=$(echo "$RESULT"    | python3 -c "import sys,json; print(json.load(sys.stdin).get('risk_score') or '')")
+              SCAN_URL=$(echo "$RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('scan_url') or '')")
+
+              echo "Verdict: $VERDICT — Risk: $SCORE"
+              [ -n "$SCAN_URL" ] && echo "Results: $SCAN_URL"
+
+              if [ "$VERDICT" = "fail" ]; then
+                echo "::error title=Strata Security::$REASON"
+                exit 1
+              fi
+              break
+            fi
+          done
+
+          if [ -z "$VERDICT" ]; then
+            echo "::error::Strata scan timed out after 12.5 minutes"
+            exit 1
+          fi
+
+          # Generate and download JSON report using the same API key
+          REPORT=$(curl -sf -X POST "$STRATA_API_URL/scans/$SCAN_ID/reports?format=json" \
+            -H "X-API-Key: $STRATA_API_KEY")
+          REPORT_ID=$(echo "$REPORT" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
+          echo "report_id=$REPORT_ID" >> $GITHUB_OUTPUT
+
+          curl -sf -L -o strata-report.json \
+            "$STRATA_API_URL/scans/$SCAN_ID/reports/$REPORT_ID" \
+            -H "X-API-Key: $STRATA_API_KEY"
+          echo "JSON report saved to strata-report.json"
+
+      - name: Upload Strata report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: strata-security-report
+          path: strata-report.json
+          if-no-files-found: warn
